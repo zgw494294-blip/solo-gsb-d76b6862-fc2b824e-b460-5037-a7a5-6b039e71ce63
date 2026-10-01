@@ -227,6 +227,7 @@ input[type="number"]:focus, input[type="text"]:focus {
 .drive-cell { font-family: var(--mono); }
 .drive-cell.zero { color: #ff9c9c; font-weight: 700; }
 .delta-ok { color: var(--ok); font-weight: 600; }
+.delta-fail { color: #ff9c9c; }
 
 
 .path-param-row {

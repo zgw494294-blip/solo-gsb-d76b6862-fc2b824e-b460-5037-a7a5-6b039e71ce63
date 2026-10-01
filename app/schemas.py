@@ -79,7 +79,8 @@ class SolveResponse(BaseModel):
 class RobustSolveRequest(SolveRequest):
     max_adjust: int = Field(
         ..., ge=1, le=255,
-        description="某路熄灭后，其余各路备用驱动级相对正常值允许的最大级差 1～255",
+        description="某路熄灭后，其余仍工作各路备用驱动级相对正常值允许的最大级差 1～255"
+        "（熄灭路归零落差不受此限）",
     )
 
 
@@ -89,7 +90,9 @@ class RobustVariantSolution(BaseModel):
     # 备用场景：被熄灭的通道 ID；正常场景为 None
     failed_id: str | None = None
     drives: list[int] = Field(..., description="各路驱动级，与 channel_ids 同序")
-    # 备用场景相对正常方案的驱动级之差；正常场景全为 0
+    # 备用场景：相对正常方案的驱动级之差；正常场景全为 0。
+    # 熄灭路 delta = 0 − 正常驱动（归零落差不受 max_adjust 限制），
+    # 仅存活通道保证 |delta| ≤ max_adjust。
     deltas: list[int] = []
     actual_rgb: list[float]
     errors: list[float] = Field(..., description="实际 − 目标")
