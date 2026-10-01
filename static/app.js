@@ -765,9 +765,16 @@ function renderRobustResult(data) {
       const delta = bk.deltas[i];
       const isFailed = id === failedId;
       const dCls = 'drive-cell' + (isFailed ? ' zero' : '');
-      const deltaTxt = delta === 0
-        ? '<span class="delta">±0</span>'
-        : `<span class="delta delta-ok">(${delta > 0 ? '+' : ''}${delta})</span>`;
+      let deltaTxt;
+      if (isFailed) {
+        // 熄灭路恒为 0，落差不受调整上限限制：单独标注，不参与 ≤ 上限判定
+        deltaTxt = '<span class="delta" title="熄灭路归零，落差不受调整上限限制">'
+          + `(${delta > 0 ? '+' : ''}${delta}，归零)</span>`;
+      } else if (delta === 0) {
+        deltaTxt = '<span class="delta">±0</span>';
+      } else {
+        deltaTxt = `<span class="delta delta-ok">(${delta > 0 ? '+' : ''}${delta})</span>`;
+      }
       return `<tr>
         <td><strong>${esc(id)}</strong>${isFailed ? ' <span class="tag warn">熄灭</span>' : ''}</td>
         <td class="drive-cell">${nd}</td>
@@ -784,7 +791,7 @@ function renderRobustResult(data) {
           <div class="robust-backup-meta">
             实际 RGB(${bk.actual_rgb.map(fmt).join(', ')})，
             备用功率 <strong>${fmt(bk.power_mw)}</strong> mW
-            （${bk.power_num}/255），各路调整 ≤ ${data.max_adjust}
+            （${bk.power_num}/255），存活各路调整 ≤ ${data.max_adjust}（熄灭路落差不受限）
           </div>
         </div>
       </div>

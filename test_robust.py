@@ -3,16 +3,17 @@
 重点：
   * 三态结论（optimal / infeasible / incomplete 的接口语义）正确；
   * 正常配方的最优性（最小正常总功率 + ID 升序字典序）用独立穷举核对：
-    备用场景中故障路必须为 0，故正常驱动级必有 d0_i ≤ max_adjust，
-    正常候选只有 (max_adjust+1)^n 个；逐故障场景枚举 256² 个备用对，
-    即可独立判定候选是否存在满足调整上限的备用配方（3 路时完整精确）；
+    备用场景中故障路必须为 0，**其落差不受 max_adjust 限制**（上限只约束
+    仍工作的两路），故正常驱动级仍取完整 0～255 域；先枚举 256² 个正常
+    (x,y)，用颜色窗口对第三级求出可行整数区间，再逐故障场景用 256²
+    存活对的二维前缀和做“d0 存活邻域盒内是否存在可行备用”的常数时间查询
+    （3 路时完整精确，不依赖 CP-SAT）；
   * 所有备用配方逐项核对：故障路为 0、调整级差不超限、颜色窗口（整数
     分子精确判定，未裁剪）、0～1000、功率自洽；
   * 单场景预求解证明的不可行（某路熄灭后无法配色）能被识别；
   * schema 对非法参数一律 422。
 """
 
-import itertools
 import random
 import sys
 
@@ -70,11 +71,16 @@ def check_result(name, channels, target, tol, adj, res):
             # 正常场景：deltas 全 0
             assert v.deltas == [0] * n
         else:
-            # 故障路必须为 0；其余各路与正常值之差不超过上限
-            assert v.drives[q - 1] == 0
+            # 故障路必须为 0；其相对正常方案的落差 = −d0 不受上限约束
+            fi = q - 1
+            assert v.drives[fi] == 0
+            assert v.deltas[fi] == -res.normal.drives[fi]
             for i in range(n):
+                if i == fi:
+                    continue
+                # 仅仍工作的通道要求与正常值之差不超过上限
                 assert abs(v.drives[i] - res.normal.drives[i]) <= adj, (
-                    f"{name}: 故障{q} 通道{i} 调整 {v.deltas[i]} 超过上限 {adj}"
+                    f"{name}: 故障{q} 存活通道{i} 调整 {v.deltas[i]} 超过上限 {adj}"
                 )
             assert v.deltas == [
                 v.drives[i] - res.normal.drives[i] for i in range(n)
@@ -105,21 +111,58 @@ def _rect_has(ps, x0, y0, x1, y1):
     ) > 0
 
 
+def _ceil_div(a: int, b: int) -> int:
+    """b > 0 时 ceil(a/b)，对负分子同样成立。"""
+    return -((-a) // b)
+
+
+def _z_span(channels, xy, target, tol):
+    """固定通道 0/1 的驱动 (x,y) 后，通道 2 满足颜色窗口的整数级区间。
+
+    每色窗口对 z 是线性不等式；rgb[2][c] = 0 时该色与 z 无关，直接核验
+    固定项。返回含端点的 (lo, hi)；不存在可行整数时返回 None。
+    """
+    x, y = xy
+    lo, hi = 0, 255
+    for c in range(3):
+        base = channels[0].rgb[c] * x + channels[1].rgb[c] * y
+        w = channels[2].rgb[c]
+        lower = 255 * (target[c] - tol)
+        upper = min(255 * (target[c] + tol), 255 * 1000)
+        if w == 0:
+            if not lower <= base <= upper:
+                return None
+            continue
+        clo = _ceil_div(lower - base, w)
+        chi = (upper - base) // w
+        lo, hi = max(lo, clo), min(hi, chi)
+        if lo > hi:
+            return None
+    return lo, hi
+
+
 def brute_force_robust(channels, target, tol, adj):
     """3 路独立穷举预言机：返回 (最优正常驱动, 最优功率分子)；无解返回 None。
 
-    关键剪枝：第 i 路熄灭时备用驱动为 0，且 |0 − d0_i| ≤ adj，故正常方案
-    必有 d0_i ≤ adj，正常候选仅 (adj+1)^n 个。每个故障场景把两条存活
-    通道的 256² 可行对存入二维 0/1 网格，用二维前缀和做“d0 的邻域盒内是否
-    存在可行备用”的常数时间查询。
+    语义：故障路驱动恒为 0，其落差（d0 → 0）**不受** adj 限制；adj 只约束
+    仍工作的通道，因此正常驱动级仍取完整 0～255 域，不能用 d0_i ≤ adj 剪枝。
+
+    做法（完全独立于 CP-SAT）：
+      1. 每个故障场景枚举 256² 个存活对，存可行网格并用二维前缀和把
+         “正常存活对 (x,y) 的 ±adj 邻域盒内是否存在可行备用”膨胀成
+         256×256 覆盖表（O(256²) 次矩形查询）；
+      2. 正常方案枚举 (x,y) ∈ 256²，第三级 z 的可行集由三色窗口求出整数
+         区间（窄容差下通常只有几个值），逐 z 查三张覆盖表即可。
+    目标为正常功率分子最小，平手时按 ID 升序驱动序列字典序最小。
     """
     n = len(channels)
     assert n == 3
     order = sorted(range(n), key=lambda k: channels[k].id)
     alive = [[i for i in range(n) if i != f] for f in range(n)]
 
-    # 每个故障场景：两条存活通道的 256×256 可行网格（故障路为 0）
-    prefixes = []
+    # 每个故障场景：(存活下标 i1,i2, 覆盖表 cover[x][y])；
+    # cover[x][y] ⇔ 正常存活对 (x,y) 的 ±adj 邻域盒内存在可行备用
+    covers = []
     for f in range(n):
         i1, i2 = alive[f]
         grid = [[0] * 256 for _ in range(256)]
@@ -134,25 +177,39 @@ def brute_force_robust(channels, target, tol, adj):
                     any_feas = True
         if not any_feas:
             return None  # 单场景本身不可行 → 整体必然不可行
-        prefixes.append((i1, i2, _prefix2d(grid)))
+        ps = _prefix2d(grid)
+        cover = [
+            [
+                1 if _rect_has(ps, x - adj, y - adj, x + adj, y + adj) else 0
+                for y in range(256)
+            ]
+            for x in range(256)
+        ]
+        covers.append((i1, i2, cover))
 
-    best = None  # (功率分子, ID 序驱动序列, 驱动)
-    for d0 in itertools.product(range(adj + 1), repeat=n):
-        if not window_ok(drives_scaled(channels, d0), target, tol):
-            continue
-        ok = True
-        for i1, i2, ps in prefixes:
-            if not _rect_has(ps, d0[i1] - adj, d0[i2] - adj,
-                             d0[i1] + adj, d0[i2] + adj):
-                ok = False
-                break
-        if not ok:
-            continue
-        pnum = sum(channels[i].power_mw * d0[i] for i in range(n))
-        key = (pnum, [d0[i] for i in order])
-        if best is None or key < best[0]:
-            best = (key, list(d0))
-    return None if best is None else (best[1], best[0][0])
+    best_key = None  # (功率分子, ID 序驱动序列)
+    best_drives = None
+    for a in range(256):
+        for b in range(256):
+            span = _z_span(channels, (a, b), target, tol)
+            if span is None:
+                continue
+            clo, chi = span
+            for c in range(clo, chi + 1):
+                d0 = (a, b, c)
+                ok = True
+                for i1, i2, cover in covers:
+                    if not cover[d0[i1]][d0[i2]]:
+                        ok = False
+                        break
+                if not ok:
+                    continue
+                pnum = sum(channels[i].power_mw * d0[i] for i in range(n))
+                key = (pnum, [d0[i] for i in order])
+                if best_key is None or key < best_key:
+                    best_key = key
+                    best_drives = list(d0)
+    return None if best_key is None else (best_drives, best_key[0])
 
 
 def check_against_brute(name, channels, target, tol, adj, expect_feasible):
@@ -194,11 +251,32 @@ def main():
     # 同例 ID 逆序输入，tie-break/最优性不变
     check_against_brute("同色白光-adj8-ID逆序", list(reversed(white3)),
                         (31, 31, 31), 1, 8, True)
-    # adj=2：正常每路必须 ≤2（故障路要降到 0），正常和至多 6 < 8 → 不可行。
-    # 但单场景预求解都可行（两路满档足够配出 (31,31,31)），不可行性来自耦合
+    # adj=2（回归：旧模型把熄灭路落差也限在 2 内 ⇒ 正常每路 ≤2、和至多 6，
+    # 误判 infeasible）。熄灭路落差不受限，正常驱动可取完整 0～255：
+    # 故障某路时另两路要在 ±2 内凑出和 8，故正常每路 ≤ 4；最便宜的 B 取满 4，
+    # 其余 4 级放次便宜的 A：正常 (4,4,0)，功率分子 3000·4+2500·4 = 22000
     res = solve_robust(white3, (31, 31, 31), 1, 2)
+    assert res.status == "optimal", res.message
+    assert res.normal.drives == [4, 4, 0], res.normal.drives
+    assert res.normal.power_num == 22000, res.normal.power_num
+    check_result("同色白光-adj2", white3, (31, 31, 31), 1, 2, res)
+    check_against_brute("同色白光-adj2-预言机", white3, (31, 31, 31), 1, 2, True)
+    # 三个备用方案逐路核对：熄灭路为 0，存活两路在 ±2 内凑出和 8。
+    # A、B 熄灭时存活对在 ±2 盒内只有唯一配法；C 熄灭时 (4,4,0) 本身即
+    # 可行，存活对有多解，只核对结构（备用只需可行，不参与目标）
+    assert res.backups[0].drives == [0, 6, 2]
+    assert res.backups[1].drives == [6, 0, 2]
+    b2 = res.backups[2].drives
+    assert b2[2] == 0 and sum(b2) == 8
+    assert all(abs(b2[i] - res.normal.drives[i]) <= 2 for i in (0, 1))
+    print("[OK] adj=2 回归：合法容错方案 optimal，正常 [4,4,0]，功率分子 22000，"
+          f"逐路备用 {[b.drives for b in res.backups]}")
+    # adj=1：穷举预言机精确判定耦合不可行（单场景预求解仍可行：两路满档
+    # 本可配出目标，但 ±1 的补偿级差无法覆盖正常方案），求解器须一致
+    assert brute_force_robust(white3, (31, 31, 31), 1, 1) is None
+    res = solve_robust(white3, (31, 31, 31), 1, 1)
     assert res.status == "infeasible" and res.normal is None and res.backups == []
-    print("[OK] 调整上限过小=无完整容错方案（耦合不可行，非单场景不可行）")
+    print("[OK] adj=1 仍为耦合不可行（上限真的不足），不返回任何正常/备用驱动级")
 
     # 2) 纯 RGB 三路：任一颜色路熄灭后无人能补该色 → 预求解即证明不可行
     rgb3 = [
@@ -242,7 +320,7 @@ def main():
     print("[OK] adj=255 时容错正常方案与普通最优配方（含字典序）完全一致")
 
     # 5) 手工构造的非平凡 3 路实例：通道接近白光但读数/功率各不相同。
-    #    目标为低亮度白；正常驱动级必须 ≤ adj（故障路要降到 0）。
+    #    目标为低亮度白；注意正常驱动级不再被压到 ≤ adj（熄灭路落差不受限）。
     #    目标/容差由穷举预言机确认可解，覆盖窄容差（2）与严格色阶。
     crafted = [
         (
